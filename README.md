@@ -58,3 +58,61 @@ Books：100TB
 知识更新	 重新训练	          更新索引（慢）	        更新教科书（快）
 可解释性	 低	                  中	                  高（能看到查了哪本书）
  
+Traditional models: memorize the corpus → compress it into the parameters. This model knows how to use a textbook.
+
+What you're building is a model that "learns autonomously."
+
+Traditional model: memorizes the textbook content → compresses it into parameters
+Your approach: learns "how to use the textbook" → when it hits a problem, it knows which book and which chapter to look it up in
+
+It's like this:
+
+Traditional model: a student who memorizes by rote
+Your model: a student who knows how to look things up and reason
+1. Key Architecture Design
+Tiered Knowledge Base Design
+Text
+Tier 1: Refined knowledge base (textbook index) - 100GB
+├─ Math: calculus, linear algebra, probability theory...
+├─ Physics: classical mechanics, quantum mechanics...
+├─ Computer Science: algorithms, operating systems, compiler theory...
+├─ Other subjects...
+Tier 2: Full corpus - 1000TB
+└─ Common Crawl, papers, code, web pages... (not used during training, optional at inference)
+Core idea:
+
+Text
+Training phase:
+  Corpus provides a passage → model queries the textbook → predicts the text → computes loss → updates parameters
+Inference phase:
+  User provides a question → model queries the textbook → generates the answer
+                             ↑
+          (identical behavior, just no loss and no parameter updates)
+5. Data Scale Estimates
+Python
+# Textbook index (resident)
+Number of textbooks: 1,000
+Size per book: 10MB
+Total PDF size: 10GB
+Vector index: ~4GB (500 words per chunk, 1,000 books × 500 pages × 2 chunks/page = 1 million chunks)
+# Training corpus (temporary, deleted after training)
+Common Crawl: 200TB
+Wikipedia: 50TB
+Books: 100TB
+Code repositories: 50TB
+Papers: 100TB
+...
+Total: ~1000TB (streamed, no need to store it all)
+# Post-training deployment package
+Model weights: 14GB (7B model)
+Textbook index: 4GB
+Total: ~18GB
+→ Inference needs only 18GB, can run on a single GPU
+6. Advantages of This Approach
+Comparison	Traditional LLM	Traditional RAG	My Approach
+Training data	1000TB all compressed into parameters	1000TB pretraining	1000TB to train capability
+Knowledge storage	In parameters (prone to going stale)	In vector store (must index everything)	In textbooks (refined + authoritative)
+Inference behavior	Generate from memory	Query the full store, then generate	Query the textbook, then generate
+Deployment size	175GB	70GB model + 1000TB index	14GB model + 4GB index
+Knowledge updates	Retrain	Update index (slow)	Update textbooks (fast)
+Interpretability	Low	Medium	High (you can see which book was consulted)
