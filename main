@@ -1,0 +1,328 @@
+import torch
+import torch.nn as nn
+from transformers import AutoModelForCausalLM, AutoTokenizer
+from typing import List, Dict
+
+class TextbookAugmentedTraining:
+    def __init__(
+        self, 
+        model_name: str = "meta-llama/Llama-2-7b-hf",
+        textbook_index_path: str = "./textbook_index"
+    ):
+        # 模型：需要训练的参数
+        self.model = AutoModelForCausalLM.from_pretrained(model_name)
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+        
+        # 教科书索引：训练和推理都用，不更新
+        self.textbook_index = self.load_textbook_index(textbook_index_path)
+        
+        # 检索控制器：学会何时查、查什么
+        self.retrieval_head = nn.Linear(
+            self.model.config.hidden_size, 
+            2  # [不查, 查]
+        )
+        
+    def train_step(self, corpus_batch: List[str]) -> torch.Tensor:
+        """
+        训练的核心：用语料库作为目标，强制模型学会查教科书
+        
+        Args:
+            corpus_batch: 从1000TB语料采样的一批文本
+        
+        Returns:
+            loss: 本批次的损失
+        """
+        total_loss = 0
+        
+        for text in corpus_batch:
+            # 1. 模型读部分文本，决定是否需要查教科书
+            prefix, target = self.split_text(text)  # 前一半、后一半
+            
+            # 2. 获取模型的隐藏状态
+            inputs = self.tokenizer(prefix, return_tensors="pt")
+            outputs = self.model(**inputs, output_hidden_states=True)
+            last_hidden = outputs.hidden_states[-1][:, -1, :]  # [batch, hidden]
+            
+            # 3. 决定是否检索（这是需要学习的）
+            retrieval_logits = self.retrieval_head(last_hidden)
+            should_retrieve = torch.argmax(retrieval_logits, dim=-1)
+            
+            # 4. 如果决定检索，就去查教科书
+            if should_retrieve == 1:
+                # 从文本内容提取查询
+                query = self.extract_query(prefix, target)
+                retrieved_facts = self.textbook_index.search(query, top_k=3)
+                
+                # 把检索结果加入上下文
+                augmented_input = self.format_with_retrieval(
+                    prefix, retrieved_facts
+                )
+            else:
+                augmented_input = prefix
+            
+            # 5. 用增强后的输入预测目标文本
+            inputs = self.tokenizer(
+                augmented_input + target,
+                return_tensors="pt"
+            )
+            labels = inputs.input_ids.clone()
+            # mask掉输入部分，只计算目标部分的loss
+            prefix_len = len(self.tokenizer(augmented_input).input_ids)
+            labels[:, :prefix_len] = -100
+            
+            outputs = self.model(**inputs, labels=labels)
+            
+            # 6. 计算loss：包括生成loss和检索决策loss
+            generation_loss = outputs.loss
+            
+            # 检索决策的监督信号：如果查了教科书后loss降低，就奖励"查"的决策
+            retrieval_reward = self.compute_retrieval_reward(
+                prefix, target, retrieved_facts if should_retrieve == 1 else None
+            )
+            retrieval_loss = -retrieval_logits[:, should_retrieve] * retrieval_reward
+            
+            total_loss += generation_loss + 0.1 * retrieval_loss
+        
+        return total_loss / len(corpus_batch)
+    
+    def inference(self, question: str, max_length: int = 512) -> str:
+        """
+        推理：跟训练时完全相同的流程，只是没有loss计算
+        """
+        current_text = question
+        generated_tokens = []
+        
+        for _ in range(max_length):
+            # 1. 决定是否需要查教科书
+            inputs = self.tokenizer(current_text, return_tensors="pt")
+            outputs = self.model(**inputs, output_hidden_states=True)
+            last_hidden = outputs.hidden_states[-1][:, -1, :]
+            
+            retrieval_logits = self.retrieval_head(last_hidden)
+            should_retrieve = torch.argmax(retrieval_logits, dim=-1)
+            
+            # 2. 如果需要，查教科书
+            if should_retrieve == 1:
+                query = self.form_query_from_context(current_text)
+                retrieved_facts = self.textbook_index.search(query, top_k=3)
+                current_text = self.format_with_retrieval(
+                    current_text, retrieved_facts
+                )
+            
+            # 3. 生成下一个token
+            outputs = self.model.generate(
+                **self.tokenizer(current_text, return_tensors="pt"),
+                max_new_tokens=1
+            )
+            next_token = outputs[0, -1]
+            generated_tokens.append(next_token)
+            
+            # 4. 更新上下文
+            current_text = self.tokenizer.decode(
+                self.tokenizer.encode(current_text) + [next_token]
+            )
+            
+            # 5. 检查是否结束
+            if next_token == self.tokenizer.eos_token_id:
+                break
+        
+        return self.tokenizer.decode(generated_tokens)
+    
+    def extract_query(self, prefix: str, target: str) -> str:
+        """
+        从上下文中提取查询关键词
+        这可以用简单的TF-IDF，也可以训练一个小模型
+        """
+        # 简单实现：提取目标文本中的名词短语
+        # 实际应该更智能
+        from sklearn.feature_extraction.text import TfidfVectorizer
+        
+        vectorizer = TfidfVectorizer(max_features=5)
+        vectorizer.fit([prefix + " " + target])
+        keywords = vectorizer.get_feature_names_out()
+        return " ".join(keywords)
+    
+    def compute_retrieval_reward(
+        self, 
+        prefix: str, 
+        target: str, 
+        retrieved_facts: List[str]
+    ) -> float:
+        """
+        计算检索的价值：查了书之后预测准确度提升了多少
+        """
+        # 不查书的loss
+        loss_without = self.compute_loss(prefix, target)
+        
+        # 查书后的loss
+        if retrieved_facts:
+            augmented = self.format_with_retrieval(prefix, retrieved_facts)
+            loss_with = self.compute_loss(augmented, target)
+            reward = loss_without - loss_with  # loss降低 = 正奖励
+        else:
+            reward = 0
+        
+        return reward
+
+
+class TextbookIndex:
+    """教科书索引：训练和推理共享"""
+    
+    def __init__(self, textbooks_dir: str):
+        from sentence_transformers import SentenceTransformer
+        import faiss
+        
+        self.encoder = SentenceTransformer('BAAI/bge-large-en-v1.5')
+        self.index = None
+        self.chunks = []
+        
+        # 一次性构建，之后不变
+        self.build_index(textbooks_dir)
+    
+    def build_index(self, textbooks_dir: str):
+        """
+        把所有教科书切块、向量化、建索引
+        这一步只做一次，训练和推理都用这个索引
+        """
+        import os
+        from pypdf import PdfReader
+        
+        print("正在索引教科书...")
+        
+        # 1. 读取所有教科书
+        for filename in os.listdir(textbooks_dir):
+            if filename.endswith('.pdf'):
+                pdf_path = os.path.join(textbooks_dir, filename)
+                reader = PdfReader(pdf_path)
+                
+                text = ""
+                for page in reader.pages:
+                    text += page.extract_text()
+                
+                # 2. 切块
+                chunks = self.chunk_text(text, chunk_size=500)
+                self.chunks.extend([
+                    {"text": chunk, "source": filename}
+                    for chunk in chunks
+                ])
+        
+        # 3. 向量化
+        texts = [c["text"] for c in self.chunks]
+        embeddings = self.encoder.encode(texts, show_progress_bar=True)
+        
+        # 4. 建立FAISS索引（快速近似最近邻搜索）
+        dimension = embeddings.shape[1]
+        self.index = faiss.IndexFlatIP(dimension)  # 内积相似度
+        self.index.add(embeddings)
+        
+        print(f"索引完成：{len(self.chunks)}个chunk")
+    
+    def search(self, query: str, top_k: int = 3) -> List[Dict]:
+        """查询教科书"""
+        query_embedding = self.encoder.encode([query])
+        distances, indices = self.index.search(query_embedding, top_k)
+        
+        results = []
+        for idx in indices[0]:
+            results.append(self.chunks[idx])
+        
+        return results
+    
+    def chunk_text(self, text: str, chunk_size: int = 500) -> List[str]:
+        """把长文本切成小块"""
+        words = text.split()
+        chunks = []
+        for i in range(0, len(words), chunk_size):
+            chunk = " ".join(words[i:i+chunk_size])
+            chunks.append(chunk)
+        return chunks
+
+        ###2、training:
+        def main():
+    # 1. 准备教科书索引（只构建一次）
+    textbook_index = TextbookIndex("./textbooks/")
+    # 包含：calculus.pdf, linear_algebra.pdf, physics.pdf, ...
+    
+    # 2. 初始化训练器
+    trainer = TextbookAugmentedTraining(
+        model_name="meta-llama/Llama-2-7b-hf",
+        textbook_index_path="./textbook_index"
+    )
+    trainer.textbook_index = textbook_index
+    
+    # 3. 准备语料库数据流（1000TB，流式读取）
+    corpus_stream = CorpusDataLoader(
+        paths=["s3://common-crawl/...", "s3://wikipedia/...", ...],
+        batch_size=32
+    )
+    
+    # 4. 训练
+    optimizer = torch.optim.AdamW(trainer.model.parameters(), lr=1e-5)
+    
+    for epoch in range(3):
+        for batch_idx, corpus_batch in enumerate(corpus_stream):
+            # 每个batch：用语料文本做目标，查教科书辅助预测
+            loss = trainer.train_step(corpus_batch)
+            
+            loss.backward()
+            optimizer.step()
+            optimizer.zero_grad()
+            
+            if batch_idx % 100 == 0:
+                print(f"Epoch {epoch}, Batch {batch_idx}, Loss: {loss.item()}")
+        
+        # 每个epoch结束，保存checkpoint
+        torch.save({
+            'model': trainer.model.state_dict(),
+            'retrieval_head': trainer.retrieval_head.state_dict(),
+        }, f'checkpoint_epoch_{epoch}.pt')
+    
+    # 5. 训练结束，语料库可以删除
+    # 推理时只需要：模型 + 教科书索引
+
+# 语料库数据加载器（流式，因为1000TB装不进内存）
+class CorpusDataLoader:
+    def __init__(self, paths: List[str], batch_size: int):
+        self.paths = paths
+        self.batch_size = batch_size
+    
+    def __iter__(self):
+        for path in self.paths:
+            # 流式读取，比如用datasets库读HuggingFace数据集
+            from datasets import load_dataset
+            dataset = load_dataset("json", data_files=path, streaming=True)
+            
+            batch = []
+            for item in dataset:
+                batch.append(item['text'])
+                if len(batch) == self.batch_size:
+                    yield batch
+                    batch = []
+
+###inferencing:
+# 推理环境：只需要模型 + 教科书索引
+
+class DeployedModel:
+    def __init__(self):
+        # 加载训练好的模型
+        self.trainer = TextbookAugmentedTraining(
+            model_name="./trained_model",  # 训练好的权重
+            textbook_index_path="./textbook_index"  # 同一个教科书索引
+        )
+        self.trainer.model.eval()
+    
+    def answer(self, question: str) -> str:
+        with torch.no_grad():
+            return self.trainer.inference(question)
+
+# 使用
+model = DeployedModel()
+print(model.answer("求函数f(x)=x^3-3x在区间[0,2]上的最大值"))
+# 模型会：
+# 1. 识别这是微积分问题
+# 2. 查询 calculus.pdf 相关章节
+# 3. 应用求导方法
+# 4. 返回答案
+
+
+    
